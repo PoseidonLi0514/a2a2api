@@ -19,9 +19,23 @@ import {
 } from "./openai.js";
 import { initSse, sseDone, sseSendJson } from "./sse.js";
 import { parseA2ABaseStream } from "./a2abaseStream.js";
+import { configureNetworking } from "./net.js";
+import { asyncHandler } from "./asyncHandler.js";
+
+function requireAuth(authToken: string) {
+  return (req: any, res: any, next: any) => {
+    const auth = req.header("authorization") || "";
+    const token = auth.startsWith("Bearer ") ? auth.slice("Bearer ".length) : "";
+    if (!token || token !== authToken) {
+      return sendOpenAIError(res, 401, "Unauthorized", { code: "unauthorized" });
+    }
+    next();
+  };
+}
 
 async function main() {
   const config = await loadConfig();
+  configureNetworking({ ipv4Only: config.ipv4Only, useEnvProxy: config.useEnvProxy });
   const pool = new AgentPool(config);
 
   await pool.init();
@@ -29,18 +43,68 @@ async function main() {
   const app = express();
   app.use(express.json({ limit: "2mb" }));
 
-  app.use((req, res, next) => {
-    const auth = req.header("authorization") || "";
-    const token = auth.startsWith("Bearer ") ? auth.slice("Bearer ".length) : "";
-    if (!token || token !== config.authToken) {
-      return sendOpenAIError(res, 401, "Unauthorized", { code: "unauthorized" });
-    }
-    next();
-  });
-
   app.get("/health", (_req, res) => res.json({ ok: true }));
 
-  app.post("/v1/chat/completions", async (req, res) => {
+  // Admin UI (no auth for static assets; API requires auth and is used after login in UI)
+  app.use("/admin", express.static(new URL("../ui/", import.meta.url).pathname, { index: ["index.html"] }));
+
+  // Admin API
+  app.get("/admin/api/state", requireAuth(config.authToken), (_req, res) => {
+    const state = pool.getStateSummary();
+    // Mask api keys: only show keyId + last 4 chars
+    res.json({
+      ...state,
+      keys: state.keys.map((k) => ({
+        ...k,
+        keyId: k.keyId,
+      })),
+    });
+  });
+
+  app.post(
+    "/admin/api/keys/bulk",
+    requireAuth(config.authToken),
+    asyncHandler(async (req, res) => {
+    const raw = typeof req.body?.keys === "string" ? req.body.keys : "";
+    const keys = raw
+      .split(/\r?\n/g)
+      .map((s: string) => s.trim())
+      .filter(Boolean);
+    const result = await pool.addKeys(keys, "key");
+    res.json(result);
+    }),
+  );
+
+  app.delete(
+    "/admin/api/keys/:keyId",
+    requireAuth(config.authToken),
+    asyncHandler(async (req, res) => {
+    const keyId = String(req.params.keyId || "");
+    const ok = await pool.removeKeyById(keyId, { deleteAgents: true });
+    res.json({ ok });
+    }),
+  );
+
+  app.post(
+    "/admin/api/keys/:keyId/sync",
+    requireAuth(config.authToken),
+    asyncHandler(async (req, res) => {
+    const keyId = String(req.params.keyId || "");
+    const ok = await pool.syncKeyById(keyId);
+    res.json({ ok });
+    }),
+  );
+
+  app.post(
+    "/admin/api/sync",
+    requireAuth(config.authToken),
+    asyncHandler(async (_req, res) => {
+      await pool.syncAllKeys();
+      res.json({ ok: true });
+    }),
+  );
+
+  app.post("/v1/chat/completions", requireAuth(config.authToken), async (req, res) => {
     const debug = createDebugSession({ enabled: config.debug, dir: config.debugDir });
     res.setHeader("X-Request-Id", debug.requestId);
 
@@ -72,7 +136,7 @@ async function main() {
         promptChars: promptToSend.length,
       });
 
-      lease = await pool.leaseAgent();
+      lease = await pool.leaseAgentAnyKey();
       const client = pool.getA2ABaseClientForKey(lease.keyIndex);
 
       debug.log("agent.lease", { agentId: lease.agentId, keyIndex: lease.keyIndex });
@@ -87,6 +151,8 @@ async function main() {
       const started = await client.startAgent(thread.thread_id, {
         agent_id: lease.agentId,
         model_name: body.model,
+        enable_thinking: true,
+        reasoning_effort: typeof (body as any).reasoning_effort === "string" ? (body as any).reasoning_effort : "high",
         stream: true,
       });
       debug.log("agent.start.ok", { agentRunId: started.agent_run_id, status: started.status });
@@ -129,8 +195,13 @@ async function main() {
               contentObj = null;
             }
           }
-          const delta = typeof contentObj?.content === "string" ? contentObj.content : "";
+          const textOrDelta = typeof contentObj?.content === "string" ? contentObj.content : "";
+          if (!textOrDelta) continue;
+
+          // 上游有时会发送“累计全文”而不是增量片段：如果以当前已累计内容为前缀，则只输出差分；如果完全重复则跳过。
+          const delta = fullText && textOrDelta.startsWith(fullText) ? textOrDelta.slice(fullText.length) : textOrDelta;
           if (!delta) continue;
+
           sawAssistant = true;
           fullText += delta;
           if (stream) sseSendJson(res, makeDeltaChunk(env, delta));
@@ -204,6 +275,12 @@ async function main() {
       debug.log("agent.release", { released: !!lease });
       debug.close();
     }
+  });
+
+  // Error handler (Express 4 does not catch async throw by default)
+  app.use((err: any, _req: any, res: any, _next: any) => {
+    const message = err instanceof Error ? err.message : String(err);
+    res.status(502).json({ error: { message, code: "upstream_error" } });
   });
 
   app.listen(config.port, () => {

@@ -1,0 +1,21 @@
+[Unit]
+Description=oaiproxy (OpenAI Chat Completions -> A2ABase)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/a2abase/oaiproxy
+Environment=NODE_ENV=production
+Environment=PORT=8080
+Environment=A2ABASE_API_URL=https://a2abase.ai/api
+Environment=OAIPROXY_MAX_AGENTS=10
+Environment=OAIPROXY_AGENT_POOL_SIZE=8
+Environment=OAIPROXY_DEBUG=0
+Environment=OAIPROXY_AUTH_TOKEN=change-me
+ExecStart=/usr/bin/node /opt/a2abase/oaiproxy/dist/index.js
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+

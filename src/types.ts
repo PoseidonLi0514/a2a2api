@@ -18,6 +18,7 @@ export type OpenAIChatCompletionsRequest = {
   messages: OpenAIChatMessage[];
   stream?: boolean | null;
   stream_options?: { include_usage?: boolean } | null;
+  reasoning_effort?: string;
   tools?: unknown;
   tool_choice?: unknown;
 };
@@ -97,4 +98,3 @@ export type A2ABaseStartAgentResponse = {
   agent_run_id: string;
   status: string;
 };
-

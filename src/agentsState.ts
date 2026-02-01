@@ -16,6 +16,7 @@ export type AgentsStateFile = {
   version: 1;
   maxAgents: number;
   poolSizePerKey: number;
+  globalRoundRobin?: number;
   keys: KeyState[];
 };
 
@@ -26,6 +27,7 @@ export async function loadOrInitAgentsState(config: ProxyConfig): Promise<Agents
     if (!parsed.keys || !Array.isArray(parsed.keys)) throw new Error("Invalid agents.json: missing keys");
     parsed.maxAgents = parsed.maxAgents || config.maxAgents;
     parsed.poolSizePerKey = parsed.poolSizePerKey || config.poolSizePerKey;
+    parsed.globalRoundRobin = parsed.globalRoundRobin ?? 0;
     for (const k of parsed.keys) {
       k.keyId = k.keyId || keyIdForApiKey(k.apiKey);
       k.roundRobin = k.roundRobin ?? 0;
@@ -38,15 +40,8 @@ export async function loadOrInitAgentsState(config: ProxyConfig): Promise<Agents
     version: 1,
     maxAgents: config.maxAgents,
     poolSizePerKey: config.poolSizePerKey,
-    keys: [
-      {
-        label: "primary",
-        apiKey: config.a2abaseApiKey,
-        keyId: keyIdForApiKey(config.a2abaseApiKey),
-        roundRobin: 0,
-        agents: [],
-      },
-    ],
+    globalRoundRobin: 0,
+    keys: [],
   };
   await saveAgentsState(config, initial);
   return initial;
@@ -60,4 +55,3 @@ export function agentNameFor(keyId: string, slot: number): string {
   const nn = String(slot).padStart(2, "0");
   return `oaiproxy__${keyId}__${nn}`;
 }
-

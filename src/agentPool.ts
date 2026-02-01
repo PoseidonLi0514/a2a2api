@@ -3,6 +3,7 @@ import type { A2ABaseAgent } from "./types.js";
 import { A2ABaseClient } from "./a2abaseClient.js";
 import { agentNameFor, loadOrInitAgentsState, saveAgentsState, type AgentsStateFile, type KeyState } from "./agentsState.js";
 import { AsyncMutex } from "./lock.js";
+import { keyIdForApiKey } from "./crypto.js";
 
 type Lease = { keyIndex: number; agentId: string; release: () => void };
 
@@ -19,24 +20,132 @@ function parseSlotFromName(keyId: string, name: string): number | null {
 export class AgentPool {
   private state!: AgentsStateFile;
   private locksByAgentId = new Map<string, AsyncMutex>();
+  private stateMutex = new AsyncMutex();
 
   constructor(private readonly config: ProxyConfig) {}
 
   async init(): Promise<void> {
     this.state = await loadOrInitAgentsState(this.config);
-    // destructive sync at startup
-    await this.syncAllKeys();
+    // destructive sync at startup (if keys exist)
+    if (this.state.keys.length > 0) {
+      try {
+        await this.syncAllKeys();
+      } catch {
+        // 启动阶段不因为同步失败而阻止服务启动（可在管理后台手动同步/修复）
+      }
+    }
   }
 
   getDefaultA2ABaseClient(): A2ABaseClient {
     const key = this.state.keys[0];
     if (!key) throw new Error("No keys configured in agents.json");
-    return new A2ABaseClient(this.config.a2abaseApiUrl, key.apiKey);
+    return new A2ABaseClient(this.config.a2abaseApiUrl, key.apiKey, this.config.a2abaseTimeoutMs);
   }
 
   getA2ABaseClientForKey(keyIndex: number): A2ABaseClient {
     const key = this.getKeyState(keyIndex);
-    return new A2ABaseClient(this.config.a2abaseApiUrl, key.apiKey);
+    return new A2ABaseClient(this.config.a2abaseApiUrl, key.apiKey, this.config.a2abaseTimeoutMs);
+  }
+
+  getStateSummary(): {
+    version: number;
+    maxAgents: number;
+    poolSizePerKey: number;
+    keys: Array<{
+      label?: string;
+      keyId: string;
+      roundRobin: number;
+      agentCount: number;
+      agents: Array<{ slot: number; name: string; id: string }>;
+    }>;
+  } {
+    return {
+      version: this.state.version,
+      maxAgents: this.state.maxAgents,
+      poolSizePerKey: this.state.poolSizePerKey,
+      keys: (this.state.keys || []).map((k) => ({
+        label: k.label,
+        keyId: k.keyId || "",
+        roundRobin: k.roundRobin ?? 0,
+        agentCount: (k.agents || []).length,
+        agents: (k.agents || []).map((a) => ({ slot: a.slot, name: a.name, id: a.id })),
+      })),
+    };
+  }
+
+  async addKeys(apiKeys: string[], labelPrefix = "key"): Promise<{ added: number; skipped: number; errors: Array<{ keyId: string; error: string }> }> {
+    const clean = apiKeys.map((k) => k.trim()).filter(Boolean);
+    const toSyncKeyIds: string[] = [];
+    let added = 0;
+    let skipped = 0;
+
+    const release = await this.stateMutex.acquire();
+    try {
+      const existingIds = new Set((this.state.keys || []).map((k) => k.keyId).filter(Boolean) as string[]);
+      for (const apiKey of clean) {
+        const keyId = keyIdForApiKey(apiKey);
+        if (existingIds.has(keyId)) {
+          skipped += 1;
+          continue;
+        }
+        this.state.keys.push({
+          label: `${labelPrefix}-${this.state.keys.length + 1}`,
+          apiKey,
+          keyId,
+          roundRobin: 0,
+          agents: [],
+        });
+        existingIds.add(keyId);
+        toSyncKeyIds.push(keyId);
+        added += 1;
+      }
+      await saveAgentsState(this.config, this.state);
+    } finally {
+      release();
+    }
+
+    const errors: Array<{ keyId: string; error: string }> = [];
+    for (const keyId of toSyncKeyIds) {
+      const idx = this.state.keys.findIndex((k) => k.keyId === keyId);
+      if (idx === -1) continue;
+      try {
+        await this.syncKey(idx);
+      } catch (e) {
+        errors.push({ keyId, error: e instanceof Error ? e.message : String(e) });
+      }
+    }
+    await saveAgentsState(this.config, this.state);
+
+    return { added, skipped, errors };
+  }
+
+  async removeKeyById(keyId: string, opts?: { deleteAgents?: boolean }): Promise<boolean> {
+    let removed: { apiKey: string; agents: Array<{ id: string }> } | null = null;
+    const release = await this.stateMutex.acquire();
+    try {
+      const idx = this.state.keys.findIndex((k) => k.keyId === keyId);
+      if (idx === -1) return false;
+      const key = this.state.keys[idx]!;
+      removed = { apiKey: key.apiKey, agents: (key.agents || []).map((a) => ({ id: a.id })) };
+      this.state.keys.splice(idx, 1);
+      await saveAgentsState(this.config, this.state);
+    } finally {
+      release();
+    }
+
+    if (removed && opts?.deleteAgents !== false) {
+      const client = new A2ABaseClient(this.config.a2abaseApiUrl, removed.apiKey, this.config.a2abaseTimeoutMs);
+      for (const a of removed.agents) await client.deleteAgent(a.id).catch(() => undefined);
+    }
+    return true;
+  }
+
+  async syncKeyById(keyId: string): Promise<boolean> {
+    const idx = this.state.keys.findIndex((k) => k.keyId === keyId);
+    if (idx === -1) return false;
+    await this.syncKey(idx);
+    await saveAgentsState(this.config, this.state);
+    return true;
   }
 
   private getKeyState(keyIndex: number): KeyState {
@@ -76,17 +185,17 @@ export class AgentPool {
 
   private async syncKey(keyIndex: number): Promise<void> {
     const key = this.getKeyState(keyIndex);
-    const client = new A2ABaseClient(this.config.a2abaseApiUrl, key.apiKey);
+    const client = new A2ABaseClient(this.config.a2abaseApiUrl, key.apiKey, this.config.a2abaseTimeoutMs);
 
     const keyId = key.keyId!;
     const poolSize = Math.min(this.state.poolSizePerKey || this.config.poolSizePerKey, this.state.maxAgents || this.config.maxAgents);
     const expectedSlots = Array.from({ length: poolSize }, (_, i) => i + 1);
     const expectedNames = new Map<number, string>(expectedSlots.map((s) => [s, agentNameFor(keyId, s)]));
 
-    // Fetch agents by prefix (search by keyId prefix).
+    // 后端 search 语义不保证包含匹配；这里直接全量拉取并用 name 前缀过滤，避免误判“缺 slot”导致创建失败。
     const prefixSearch = `oaiproxy__${keyId}__`;
-    const foundBySearch = await client.listAgents({ page: 1, limit: 100, search: prefixSearch }).catch(() => ({ agents: [] as A2ABaseAgent[] }));
-    const remoteCandidates = (foundBySearch.agents || []).filter((a) => a?.name?.includes(prefixSearch));
+    const allAgentsInitial = await this.listAllAgents(client);
+    const remoteCandidates = allAgentsInitial.filter((a) => typeof a?.name === "string" && a.name.startsWith(prefixSearch));
 
     const toDelete: A2ABaseAgent[] = [];
     const bySlot = new Map<number, A2ABaseAgent[]>();
@@ -177,21 +286,19 @@ export class AgentPool {
     }));
   }
 
-  async leaseAgent(): Promise<Lease> {
-    // Current phase: single key only (index 0). Multi-key selection later.
-    const keyIndex = 0;
+  private async tryLeaseFromKey(keyIndex: number): Promise<Lease | null> {
     const key = this.getKeyState(keyIndex);
-    const agents = key.agents || [];
-    if (agents.length === 0) {
-      await this.syncAllKeys();
-      if (!key.agents || key.agents.length === 0) throw new Error("No agents available after sync");
+    if (!key.agents || key.agents.length === 0) {
+      await this.syncKey(keyIndex);
+      if (!key.agents || key.agents.length === 0) return null;
+      await saveAgentsState(this.config, this.state);
     }
 
-    const poolSize = key.agents!.length;
+    const poolSize = key.agents.length;
     const start = key.roundRobin ?? 0;
     for (let i = 0; i < poolSize; i++) {
       const idx = (start + i) % poolSize;
-      const agent = key.agents![idx];
+      const agent = key.agents[idx]!;
       const mutex = this.locksByAgentId.get(agent.id) || new AsyncMutex();
       this.locksByAgentId.set(agent.id, mutex);
       if (mutex.isLocked) continue;
@@ -200,7 +307,29 @@ export class AgentPool {
       await saveAgentsState(this.config, this.state);
       return { keyIndex, agentId: agent.id, release };
     }
+    return null;
+  }
 
-    throw new Error("No free agent in pool (too many concurrent requests)");
+  async leaseAgentAnyKey(): Promise<Lease> {
+    if (this.state.keys.length === 0) throw new Error("No A2ABase keys configured in agents.json");
+
+    const releaseState = await this.stateMutex.acquire();
+    const start = this.state.globalRoundRobin ?? 0;
+    this.state.globalRoundRobin = (start + 1) % this.state.keys.length;
+    await saveAgentsState(this.config, this.state);
+    releaseState();
+
+    for (let i = 0; i < this.state.keys.length; i++) {
+      const idx = (start + i) % this.state.keys.length;
+      try {
+        const lease = await this.tryLeaseFromKey(idx);
+        if (lease) return lease;
+      } catch {
+        // key might be invalid/out of quota; try next key
+        continue;
+      }
+    }
+
+    throw new Error("No free agent across all keys (too many concurrent requests)");
   }
 }
