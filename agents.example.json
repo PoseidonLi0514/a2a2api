@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "maxAgents": 10,
+  "poolSizePerKey": 8,
+  "keys": [
+    {
+      "label": "primary",
+      "apiKey": "pk_xxx:sk_xxx",
+      "roundRobin": 0,
+      "agents": []
+    }
+  ]
+}
+
