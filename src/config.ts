@@ -9,6 +9,8 @@ export type ProxyConfig = {
   maxAgents: number;
   poolSizePerKey: number;
   agentsFilePath: string;
+  debug: boolean;
+  debugDir?: string;
 };
 
 function mustGetEnv(name: string): string {
@@ -32,6 +34,8 @@ export async function loadConfig(): Promise<ProxyConfig> {
   const a2abaseApiKey = mustGetEnv("A2ABASE_API_KEY");
   const maxAgents = parseIntEnv("OAIPROXY_MAX_AGENTS", 10);
   const poolSizePerKey = parseIntEnv("OAIPROXY_AGENT_POOL_SIZE", 8);
+  const debug = (process.env["OAIPROXY_DEBUG"] || "").toLowerCase() === "1" || (process.env["NODE_ENV"] || "").toLowerCase() === "development";
+  const debugDir = process.env["OAIPROXY_DEBUG_DIR"] || undefined;
 
   const agentsFilePath = path.join(process.cwd(), "agents.json");
   // Ensure file exists only when needed; writing handled by state layer.
@@ -45,6 +49,7 @@ export async function loadConfig(): Promise<ProxyConfig> {
     maxAgents,
     poolSizePerKey,
     agentsFilePath,
+    debug,
+    debugDir,
   };
 }
-

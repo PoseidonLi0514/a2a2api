@@ -2,7 +2,8 @@ import "dotenv/config";
 import express from "express";
 import { loadConfig } from "./config.js";
 import { AgentPool } from "./agentPool.js";
-import { sendOpenAIError } from "./httpErrors.js";
+import { isAbortError, sendOpenAIError } from "./httpErrors.js";
+import { createDebugSession } from "./debug.js";
 import {
   buildLinearizedPrompt,
   buildSystemPrompt,
@@ -40,8 +41,13 @@ async function main() {
   app.get("/health", (_req, res) => res.json({ ok: true }));
 
   app.post("/v1/chat/completions", async (req, res) => {
+    const debug = createDebugSession({ enabled: config.debug, dir: config.debugDir });
+    res.setHeader("X-Request-Id", debug.requestId);
+
     const abort = new AbortController();
-    req.on("close", () => abort.abort());
+    req.on("aborted", () => abort.abort());
+    res.on("close", () => abort.abort());
+    res.on("finish", () => debug.close());
 
     let lease: { keyIndex: number; agentId: string; release: () => void } | undefined;
     try {
@@ -57,23 +63,38 @@ async function main() {
       const promptToSend = linearPrompt || "";
       const systemPromptToSend = systemPrompt || "You are a helpful AI assistant.";
 
+      debug.log("request.in", {
+        path: req.path,
+        stream,
+        includeUsage,
+        model: body.model,
+        systemPromptChars: systemPromptToSend.length,
+        promptChars: promptToSend.length,
+      });
+
       lease = await pool.leaseAgent();
       const client = pool.getA2ABaseClientForKey(lease.keyIndex);
 
+      debug.log("agent.lease", { agentId: lease.agentId, keyIndex: lease.keyIndex });
       await client.updateAgent(lease.agentId, { system_prompt: systemPromptToSend });
+      debug.log("agent.update.ok", {});
 
       const thread = await client.createThread();
+      debug.log("thread.create.ok", { threadId: thread.thread_id });
       await client.addMessageToThread(thread.thread_id, promptToSend);
+      debug.log("thread.addMessage.ok", {});
 
       const started = await client.startAgent(thread.thread_id, {
         agent_id: lease.agentId,
         model_name: body.model,
         stream: true,
       });
+      debug.log("agent.start.ok", { agentRunId: started.agent_run_id, status: started.status });
 
       const env = newStreamEnvelope({ model: body.model });
 
       const upstreamRes = await client.streamAgentRun(started.agent_run_id, abort.signal);
+      debug.log("agent.stream.open", { status: upstreamRes.status, ok: upstreamRes.ok });
 
       let fullText = "";
       let usageFromStatus: any | undefined;
@@ -89,6 +110,8 @@ async function main() {
         if (abort.signal.aborted) break;
         const raw = ev.data;
         if (!raw || raw === "[DONE]") break;
+
+        debug.log("a2abase.sse", { data: raw.slice(0, 2000), truncated: raw.length > 2000 });
 
         let parsed: any;
         try {
@@ -150,6 +173,7 @@ async function main() {
       }
 
       const usage = normalizeUsage(usageFromStatus || usageFallback);
+      debug.log("result.usage", { hasUsage: !!usage, usage });
 
       if (stream) {
         // If upstream never produced assistant tokens, still return a valid stream end.
@@ -161,18 +185,24 @@ async function main() {
         if (includeUsage && usage) sseSendJson(res, makeUsageChunk(env, usage));
         sseDone(res);
         res.end();
+        debug.log("response.stream.done", { bytes: fullText.length });
         return;
       }
 
       res.status(200).json(makeNonStreamResponse(env, fullText, usage));
+      debug.log("response.json.done", { bytes: fullText.length });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
+      debug.log("error", { message: msg, name: (e as any)?.name, aborted: abort.signal.aborted });
       // Map some common failures.
       if (msg.includes("Unauthorized")) return sendOpenAIError(res, 401, msg, { code: "unauthorized" });
       if (msg.includes("No free agent")) return sendOpenAIError(res, 429, msg, { code: "rate_limited" });
+      if (abort.signal.aborted || isAbortError(e)) return sendOpenAIError(res, 499, "Client or upstream aborted request", { code: "request_aborted" });
       return sendOpenAIError(res, 500, msg, { code: "internal_error" });
     } finally {
       lease?.release();
+      debug.log("agent.release", { released: !!lease });
+      debug.close();
     }
   });
 

@@ -11,6 +11,13 @@ cp .env.example .env
 npm run dev
 ```
 
+## Debug
+
+Dev mode enables debug by default (`OAIPROXY_DEBUG=1`). Each request writes a log file to `oaiproxy/logs/` and also prints to stderr.
+
+- Response header: `X-Request-Id`
+- Log file: `oaiproxy/logs/oaiproxy-<requestId>.log`
+
 ## Important: agent cleanup
 
 On startup, oaiproxy syncs an agent pool and **may delete existing agents** to satisfy the platform limit (max 10 agents).
