@@ -156,6 +156,12 @@ body {
   font-size: 12px;
 }
 
+.pill.warn {
+  border-color: rgba(255, 176, 32, 0.45);
+  background: rgba(255, 176, 32, 0.10);
+  color: rgba(255, 255, 255, 0.90);
+}
+
 .grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -226,4 +232,3 @@ body {
   background: rgba(255, 77, 79, 0.10);
   color: rgba(255, 255, 255, 0.90);
 }
-

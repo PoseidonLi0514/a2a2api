@@ -22,6 +22,7 @@ npm run dev
 说明：
 - A2ABase keys **只从本地 `oaiproxy/agents.json` 读取与保存**（不会从环境变量读取）
 - agent 池按 key 单独维护，并在请求时做多 key 轮询
+- 每个 key 默认启用；如果某个 key 返回 “No credits available / Billing check failed (HTTP 402)” 会被自动禁用（可在后台手动重新启用）
 
 ## 常见报错：`TypeError: fetch failed` / `ETIMEDOUT` / `ENETUNREACH`
 
@@ -56,6 +57,7 @@ npm run dev
 
 - `POST /v1/chat/completions`
   - 支持：`model`, `messages`, `stream`, `stream_options.include_usage`（stream 默认 include_usage=true）
+  - 流式返回：当 `include_usage=true` 时，最后一个 JSON chunk 为 `choices:[] + usage`，不会额外发送 `delta:{}` 的 finish chunk（之后直接 `[DONE]`）
   - 当前阶段：忽略图片与 tool calls（后续再做）
   - 代理默认开启 A2ABase 的 `enable_thinking=true`；若请求带 `reasoning_effort`，会透传到 A2ABase（默认 `low`）
 

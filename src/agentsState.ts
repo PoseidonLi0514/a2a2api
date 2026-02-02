@@ -8,6 +8,9 @@ export type KeyState = {
   label?: string;
   apiKey: string; // plaintext allowed in local JSON
   keyId?: string;
+  enabled?: boolean;
+  disabledReason?: string;
+  disabledAt?: string;
   roundRobin?: number;
   agents?: AgentSlot[];
 };
@@ -30,6 +33,7 @@ export async function loadOrInitAgentsState(config: ProxyConfig): Promise<Agents
     parsed.globalRoundRobin = parsed.globalRoundRobin ?? 0;
     for (const k of parsed.keys) {
       k.keyId = k.keyId || keyIdForApiKey(k.apiKey);
+      k.enabled = k.enabled ?? true;
       k.roundRobin = k.roundRobin ?? 0;
       k.agents = k.agents ?? [];
     }

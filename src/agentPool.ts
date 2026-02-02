@@ -26,13 +26,9 @@ export class AgentPool {
 
   async init(): Promise<void> {
     this.state = await loadOrInitAgentsState(this.config);
-    // destructive sync at startup (if keys exist)
+    // 启动阶段不阻塞：后台尝试同步（网络不通时避免卡住进程启动）
     if (this.state.keys.length > 0) {
-      try {
-        await this.syncAllKeys();
-      } catch {
-        // 启动阶段不因为同步失败而阻止服务启动（可在管理后台手动同步/修复）
-      }
+      void this.syncAllKeys().catch(() => undefined);
     }
   }
 
@@ -54,6 +50,9 @@ export class AgentPool {
     keys: Array<{
       label?: string;
       keyId: string;
+      enabled: boolean;
+      disabledReason?: string;
+      disabledAt?: string;
       roundRobin: number;
       agentCount: number;
       agents: Array<{ slot: number; name: string; id: string }>;
@@ -66,6 +65,9 @@ export class AgentPool {
       keys: (this.state.keys || []).map((k) => ({
         label: k.label,
         keyId: k.keyId || "",
+        enabled: k.enabled ?? true,
+        disabledReason: k.disabledReason,
+        disabledAt: k.disabledAt,
         roundRobin: k.roundRobin ?? 0,
         agentCount: (k.agents || []).length,
         agents: (k.agents || []).map((a) => ({ slot: a.slot, name: a.name, id: a.id })),
@@ -92,6 +94,7 @@ export class AgentPool {
           label: `${labelPrefix}-${this.state.keys.length + 1}`,
           apiKey,
           keyId,
+          enabled: true,
           roundRobin: 0,
           agents: [],
         });
@@ -152,9 +155,45 @@ export class AgentPool {
     const key = this.state.keys[keyIndex];
     if (!key) throw new Error(`Invalid keyIndex: ${keyIndex}`);
     if (!key.keyId) throw new Error("Key missing keyId");
+    key.enabled = key.enabled ?? true;
     key.agents = key.agents ?? [];
     key.roundRobin = key.roundRobin ?? 0;
     return key;
+  }
+
+  async setKeyEnabled(keyId: string, enabled: boolean): Promise<boolean> {
+    const release = await this.stateMutex.acquire();
+    try {
+      const idx = this.state.keys.findIndex((k) => k.keyId === keyId);
+      if (idx === -1) return false;
+      const key = this.state.keys[idx]!;
+      key.enabled = enabled;
+      if (enabled) {
+        key.disabledReason = undefined;
+        key.disabledAt = undefined;
+      } else {
+        key.disabledReason = key.disabledReason || "disabled_by_admin";
+        key.disabledAt = key.disabledAt || new Date().toISOString();
+      }
+      await saveAgentsState(this.config, this.state);
+      return true;
+    } finally {
+      release();
+    }
+  }
+
+  async disableKeyByIndex(keyIndex: number, reason: string): Promise<void> {
+    const release = await this.stateMutex.acquire();
+    try {
+      const key = this.state.keys[keyIndex];
+      if (!key) return;
+      key.enabled = false;
+      key.disabledReason = reason;
+      key.disabledAt = new Date().toISOString();
+      await saveAgentsState(this.config, this.state);
+    } finally {
+      release();
+    }
   }
 
   async syncAllKeys(): Promise<void> {
@@ -288,6 +327,7 @@ export class AgentPool {
 
   private async tryLeaseFromKey(keyIndex: number): Promise<Lease | null> {
     const key = this.getKeyState(keyIndex);
+    if (key.enabled === false) return null;
     if (!key.agents || key.agents.length === 0) {
       await this.syncKey(keyIndex);
       if (!key.agents || key.agents.length === 0) return null;
@@ -313,14 +353,22 @@ export class AgentPool {
   async leaseAgentAnyKey(): Promise<Lease> {
     if (this.state.keys.length === 0) throw new Error("No A2ABase keys configured in agents.json");
 
+    const enabledIndexes = this.state.keys
+      .map((k, idx) => ({ k, idx }))
+      .filter(({ k }) => (k.enabled ?? true) === true)
+      .map(({ idx }) => idx);
+    if (enabledIndexes.length === 0) throw new Error("No enabled A2ABase keys available");
+
     const releaseState = await this.stateMutex.acquire();
-    const start = this.state.globalRoundRobin ?? 0;
-    this.state.globalRoundRobin = (start + 1) % this.state.keys.length;
+    const startPos = this.state.globalRoundRobin ?? 0;
+    const start = enabledIndexes[startPos % enabledIndexes.length]!;
+    this.state.globalRoundRobin = (startPos + 1) % enabledIndexes.length;
     await saveAgentsState(this.config, this.state);
     releaseState();
 
-    for (let i = 0; i < this.state.keys.length; i++) {
-      const idx = (start + i) % this.state.keys.length;
+    const startIdx = enabledIndexes.indexOf(start);
+    for (let i = 0; i < enabledIndexes.length; i++) {
+      const idx = enabledIndexes[(startIdx + i) % enabledIndexes.length]!;
       try {
         const lease = await this.tryLeaseFromKey(idx);
         if (lease) return lease;

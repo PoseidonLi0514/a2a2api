@@ -166,6 +166,17 @@ function keysManagerView() {
 
     const actions = el("div", { class: "key-actions" }, [
       el("button", {
+        class: k.enabled ? "btn" : "btn primary",
+        text: k.enabled ? "已启用" : "已禁用",
+        onclick: async () => {
+          await api(`/admin/api/keys/${k.keyId}/enabled`, {
+            method: "POST",
+            body: JSON.stringify({ enabled: !k.enabled }),
+          });
+          await refreshFn();
+        },
+      }),
+      el("button", {
         class: "btn",
         text: "同步",
         onclick: async () => {
@@ -187,7 +198,13 @@ function keysManagerView() {
 
     return el("tr", { class: "key-row" }, [
       el("td", {}, [details]),
-      el("td", { class: "mono", text: `${k.agentCount}` }),
+      el("td", {}, [
+        el("div", { class: "row wrap" }, [
+          el("span", { class: "pill mono", text: `${k.agentCount} agents` }),
+          el("span", { class: `pill ${k.enabled ? "" : "warn"} mono`, text: k.enabled ? "enabled" : "disabled" }),
+          k.disabledReason ? el("span", { class: "pill mono", text: `reason=${k.disabledReason}` }) : el("span"),
+        ]),
+      ]),
       el("td", {}, [actions]),
     ]);
   }
@@ -259,4 +276,3 @@ async function bootstrap() {
 }
 
 bootstrap();
-

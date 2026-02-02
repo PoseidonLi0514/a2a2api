@@ -33,6 +33,14 @@ function requireAuth(authToken: string) {
   };
 }
 
+function isNoCreditsError(message: string): boolean {
+  const m = message.toLowerCase();
+  return (
+    m.includes("http 402") &&
+    (m.includes("no credits available") || m.includes("billing check failed") || m.includes("add credits"))
+  );
+}
+
 async function main() {
   const config = await loadConfig();
   configureNetworking({ ipv4Only: config.ipv4Only, useEnvProxy: config.useEnvProxy });
@@ -89,9 +97,20 @@ async function main() {
     "/admin/api/keys/:keyId/sync",
     requireAuth(config.authToken),
     asyncHandler(async (req, res) => {
-    const keyId = String(req.params.keyId || "");
-    const ok = await pool.syncKeyById(keyId);
-    res.json({ ok });
+      const keyId = String(req.params.keyId || "");
+      const ok = await pool.syncKeyById(keyId);
+      res.json({ ok });
+    }),
+  );
+
+  app.post(
+    "/admin/api/keys/:keyId/enabled",
+    requireAuth(config.authToken),
+    asyncHandler(async (req, res) => {
+      const keyId = String(req.params.keyId || "");
+      const enabled = !!req.body?.enabled;
+      const ok = await pool.setKeyEnabled(keyId, enabled);
+      res.json({ ok });
     }),
   );
 
@@ -113,7 +132,6 @@ async function main() {
     res.on("close", () => abort.abort());
     res.on("finish", () => debug.close());
 
-    let lease: { keyIndex: number; agentId: string; release: () => void } | undefined;
     try {
       const body = validateChatCompletionsRequest(req.body);
 
@@ -136,132 +154,144 @@ async function main() {
         promptChars: promptToSend.length,
       });
 
-      lease = await pool.leaseAgentAnyKey();
-      const client = pool.getA2ABaseClientForKey(lease.keyIndex);
-
-      debug.log("agent.lease", { agentId: lease.agentId, keyIndex: lease.keyIndex });
-      await client.updateAgent(lease.agentId, { system_prompt: systemPromptToSend });
-      debug.log("agent.update.ok", {});
-
-      const thread = await client.createThread();
-      debug.log("thread.create.ok", { threadId: thread.thread_id });
-      await client.addMessageToThread(thread.thread_id, promptToSend);
-      debug.log("thread.addMessage.ok", {});
-
-      const started = await client.startAgent(thread.thread_id, {
-        agent_id: lease.agentId,
-        model_name: body.model,
-        enable_thinking: true,
-        reasoning_effort: typeof (body as any).reasoning_effort === "string" ? (body as any).reasoning_effort : "high",
-        stream: true,
-      });
-      debug.log("agent.start.ok", { agentRunId: started.agent_run_id, status: started.status });
-
       const env = newStreamEnvelope({ model: body.model });
-
-      const upstreamRes = await client.streamAgentRun(started.agent_run_id, abort.signal);
-      debug.log("agent.stream.open", { status: upstreamRes.status, ok: upstreamRes.ok });
-
-      let fullText = "";
-      let usageFromStatus: any | undefined;
-      let usageFallback: any | undefined;
-      let sawAssistant = false;
-
       if (stream) {
         initSse(res);
         sseSendJson(res, makeRoleChunk(env));
       }
 
-      for await (const ev of parseA2ABaseStream(upstreamRes)) {
-        if (abort.signal.aborted) break;
-        const raw = ev.data;
-        if (!raw || raw === "[DONE]") break;
+      const maxAttempts = Math.max(1, pool.getStateSummary().keys.length);
+      let sentAnyDelta = false;
+      let lastErr: unknown = undefined;
 
-        debug.log("a2abase.sse", { data: raw.slice(0, 2000), truncated: raw.length > 2000 });
-
-        let parsed: any;
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        const lease = await pool.leaseAgentAnyKey();
         try {
-          parsed = JSON.parse(raw);
-        } catch {
-          continue;
-        }
+          const client = pool.getA2ABaseClientForKey(lease.keyIndex);
 
-        if (parsed?.type === "assistant") {
-          let contentObj: any = parsed.content;
-          if (typeof contentObj === "string") {
+          debug.log("agent.lease", { agentId: lease.agentId, keyIndex: lease.keyIndex, attempt });
+          await client.updateAgent(lease.agentId, { system_prompt: systemPromptToSend });
+          debug.log("agent.update.ok", {});
+
+          const thread = await client.createThread();
+          debug.log("thread.create.ok", { threadId: thread.thread_id });
+          await client.addMessageToThread(thread.thread_id, promptToSend);
+          debug.log("thread.addMessage.ok", {});
+
+          const started = await client.startAgent(thread.thread_id, {
+            agent_id: lease.agentId,
+            model_name: body.model,
+            enable_thinking: true,
+            reasoning_effort: typeof (body as any).reasoning_effort === "string" ? (body as any).reasoning_effort : "low",
+            stream: true,
+          });
+          debug.log("agent.start.ok", { agentRunId: started.agent_run_id, status: started.status });
+
+          const upstreamRes = await client.streamAgentRun(started.agent_run_id, abort.signal);
+          debug.log("agent.stream.open", { status: upstreamRes.status, ok: upstreamRes.ok });
+
+          let fullText = "";
+          let usageFromStatus: any | undefined;
+          let usageFallback: any | undefined;
+
+          for await (const ev of parseA2ABaseStream(upstreamRes)) {
+            if (abort.signal.aborted) break;
+            const raw = ev.data;
+            if (!raw || raw === "[DONE]") break;
+
+            debug.log("a2abase.sse", { data: raw.slice(0, 2000), truncated: raw.length > 2000 });
+
+            let parsed: any;
             try {
-              contentObj = JSON.parse(contentObj);
+              parsed = JSON.parse(raw);
             } catch {
-              contentObj = null;
+              continue;
             }
-          }
-          const textOrDelta = typeof contentObj?.content === "string" ? contentObj.content : "";
-          if (!textOrDelta) continue;
 
-          // 上游有时会发送“累计全文”而不是增量片段：如果以当前已累计内容为前缀，则只输出差分；如果完全重复则跳过。
-          const delta = fullText && textOrDelta.startsWith(fullText) ? textOrDelta.slice(fullText.length) : textOrDelta;
-          if (!delta) continue;
-
-          sawAssistant = true;
-          fullText += delta;
-          if (stream) sseSendJson(res, makeDeltaChunk(env, delta));
-          continue;
-        }
-
-        if (parsed?.type === "assistant_response_end") {
-          // Upstream often provides an OpenAI-like object here (stringified).
-          const rawContent = parsed.content;
-          if (typeof rawContent === "string") {
-            try {
-              const obj = JSON.parse(rawContent);
-              usageFallback = obj?.usage ?? usageFallback;
-              // Also acts as a signal that assistant is done; we still wait for thread_run_end usage if available.
-            } catch {
-              // ignore
-            }
-          }
-          continue;
-        }
-
-        if (parsed?.type === "status") {
-          // content is a JSON string
-          const rawContent = parsed.content;
-          if (typeof rawContent === "string") {
-            try {
-              const obj = JSON.parse(rawContent);
-              if (obj?.status_type === "thread_run_end" && obj?.usage) {
-                usageFromStatus = obj.usage;
+            if (parsed?.type === "assistant") {
+              let contentObj: any = parsed.content;
+              if (typeof contentObj === "string") {
+                try {
+                  contentObj = JSON.parse(contentObj);
+                } catch {
+                  contentObj = null;
+                }
               }
-            } catch {
-              // ignore
+              const textOrDelta = typeof contentObj?.content === "string" ? contentObj.content : "";
+              if (!textOrDelta) continue;
+
+              const delta = fullText && textOrDelta.startsWith(fullText) ? textOrDelta.slice(fullText.length) : textOrDelta;
+              if (!delta) continue;
+
+              sentAnyDelta = true;
+              fullText += delta;
+              if (stream) sseSendJson(res, makeDeltaChunk(env, delta));
+              continue;
             }
+
+            if (parsed?.type === "assistant_response_end") {
+              const rawContent = parsed.content;
+              if (typeof rawContent === "string") {
+                try {
+                  const obj = JSON.parse(rawContent);
+                  usageFallback = obj?.usage ?? usageFallback;
+                } catch {
+                  // ignore
+                }
+              }
+              continue;
+            }
+
+            if (parsed?.type === "status") {
+              const rawContent = parsed.content;
+              if (typeof rawContent === "string") {
+                try {
+                  const obj = JSON.parse(rawContent);
+                  if (obj?.status_type === "thread_run_end" && obj?.usage) {
+                    usageFromStatus = obj.usage;
+                  }
+                } catch {
+                  // ignore
+                }
+              }
+              continue;
+            }
+
+            if (parsed?.status === "completed") break;
           }
-          // Some status events may indicate completion.
-          continue;
-        }
 
-        if (parsed?.status === "completed") break;
+          const usage = normalizeUsage(usageFromStatus || usageFallback);
+          debug.log("result.usage", { hasUsage: !!usage, usage });
+
+          if (stream) {
+            // 按需求：当 include_usage 时，去掉 OpenAI 标准里的 “空 delta + finish_reason” 块，
+            // 直接让 usage chunk 成为最后一个 JSON 块（再跟 [DONE]）。
+            if (!includeUsage) sseSendJson(res, makeFinishChunk(env, "stop"));
+            if (includeUsage && usage) sseSendJson(res, makeUsageChunk(env, usage));
+            sseDone(res);
+            res.end();
+            debug.log("response.stream.done", { bytes: fullText.length });
+            return;
+          }
+
+          res.status(200).json(makeNonStreamResponse(env, fullText, usage));
+          debug.log("response.json.done", { bytes: fullText.length });
+          return;
+        } catch (e) {
+          lastErr = e;
+          const msg = e instanceof Error ? e.message : String(e);
+          if (isNoCreditsError(msg)) {
+            debug.log("key.auto_disable", { keyIndex: lease.keyIndex, reason: "no_credits", sentAnyDelta });
+            await pool.disableKeyByIndex(lease.keyIndex, "no_credits");
+            if (!sentAnyDelta) continue;
+          }
+          throw e;
+        } finally {
+          lease.release();
+        }
       }
 
-      const usage = normalizeUsage(usageFromStatus || usageFallback);
-      debug.log("result.usage", { hasUsage: !!usage, usage });
-
-      if (stream) {
-        // If upstream never produced assistant tokens, still return a valid stream end.
-        if (!sawAssistant) {
-          // no-op
-        }
-
-        sseSendJson(res, makeFinishChunk(env, "stop"));
-        if (includeUsage && usage) sseSendJson(res, makeUsageChunk(env, usage));
-        sseDone(res);
-        res.end();
-        debug.log("response.stream.done", { bytes: fullText.length });
-        return;
-      }
-
-      res.status(200).json(makeNonStreamResponse(env, fullText, usage));
-      debug.log("response.json.done", { bytes: fullText.length });
+      throw (lastErr instanceof Error ? lastErr : new Error("No enabled key could complete the request"));
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       debug.log("error", { message: msg, name: (e as any)?.name, aborted: abort.signal.aborted });
@@ -271,8 +301,6 @@ async function main() {
       if (abort.signal.aborted || isAbortError(e)) return sendOpenAIError(res, 499, "Client or upstream aborted request", { code: "request_aborted" });
       return sendOpenAIError(res, 500, msg, { code: "internal_error" });
     } finally {
-      lease?.release();
-      debug.log("agent.release", { released: !!lease });
       debug.close();
     }
   });
