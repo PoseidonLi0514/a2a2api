@@ -175,8 +175,8 @@ async function main() {
 
           const thread = await client.createThread();
           debug.log("thread.create.ok", { threadId: thread.thread_id });
-          await client.addMessageToThread(thread.thread_id, promptToSend);
-          debug.log("thread.addMessage.ok", {});
+          await client.createMessage(thread.thread_id, promptToSend);
+          debug.log("thread.createMessage.ok", {});
 
           const started = await client.startAgent(thread.thread_id, {
             agent_id: lease.agentId,

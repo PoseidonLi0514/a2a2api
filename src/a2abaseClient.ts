@@ -12,6 +12,12 @@ export class A2ABaseClient {
     private readonly timeoutMs: number = 30000,
   ) {}
 
+  private truncate(text: string, max = 2000): string {
+    if (!text) return text;
+    if (text.length <= max) return text;
+    return `${text.slice(0, max)}…(truncated, total=${text.length})`;
+  }
+
   private headers(extra?: Record<string, string>): Record<string, string> {
     return {
       Accept: "application/json",
@@ -23,7 +29,7 @@ export class A2ABaseClient {
   private async json<T>(res: Response): Promise<T> {
     if (!res.ok) {
       const text = await res.text().catch(() => "");
-      throw new Error(`A2ABase HTTP ${res.status}: ${text || res.statusText}`);
+      throw new Error(`A2ABase HTTP ${res.status}: ${this.truncate(text || res.statusText)}`);
     }
     return (await res.json()) as T;
   }
@@ -74,7 +80,7 @@ export class A2ABaseClient {
     });
     if (!res.ok) {
       const text = await res.text().catch(() => "");
-      throw new Error(`A2ABase updateAgent HTTP ${res.status}: ${text || res.statusText}`);
+      throw new Error(`A2ABase updateAgent HTTP ${res.status}: ${this.truncate(text || res.statusText)}`);
     }
   }
 
@@ -85,7 +91,7 @@ export class A2ABaseClient {
     });
     if (!res.ok) {
       const text = await res.text().catch(() => "");
-      throw new Error(`A2ABase deleteAgent HTTP ${res.status}: ${text || res.statusText}`);
+      throw new Error(`A2ABase deleteAgent HTTP ${res.status}: ${this.truncate(text || res.statusText)}`);
     }
   }
 
@@ -104,6 +110,17 @@ export class A2ABaseClient {
       method: "POST",
       // Python SDK removes Content-Type for this call.
       headers: this.headers(),
+    });
+    return await this.json(res);
+  }
+
+  async createMessage(threadId: string, content: string): Promise<{ message_id: string }> {
+    // 避免把超长 prompt 放进 query 参数导致 Cloudflare/上游返回 520/4xx。
+    // 使用官方 threads messages JSON 接口（Python SDK: ThreadsClient.create_message）。
+    const res = await this.fetchWithTimeout(`${this.baseUrl}/threads/${threadId}/messages`, {
+      method: "POST",
+      headers: this.headers({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ content, type: "user", is_llm_message: true }),
     });
     return await this.json(res);
   }
@@ -128,7 +145,7 @@ export class A2ABaseClient {
     });
     if (!res.ok) {
       const text = await res.text().catch(() => "");
-      throw new Error(`A2ABase streamAgentRun HTTP ${res.status}: ${text || res.statusText}`);
+      throw new Error(`A2ABase streamAgentRun HTTP ${res.status}: ${this.truncate(text || res.statusText)}`);
     }
     return res;
   }
